@@ -128,6 +128,32 @@ app.post('/webhooks/fulfillments/create', express.text({ type: '*/*' }), async (
     }
 });
 
+// 5. NEW Route: Fetch Tracking URL for the customer-facing page
+app.get('/get-tracking-url', async (req, res) => {
+  const { orderNumber } = req.query;
+
+  if (!orderNumber) {
+    return res.status(400).json({ error: 'Order number is required.' });
+  }
+
+  try {
+    const ordersRef = db.collection('orders');
+    const snapshot = await ordersRef.where('orderNumber', '==', orderNumber).limit(1).get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    const orderData = snapshot.docs[0].data();
+    res.status(200).json({ trackingUrl: orderData.trackingUrl });
+
+  } catch (error) {
+    console.error('Error fetching tracking URL:', error);
+    res.status(500).json({ error: 'An internal server error occurred.' });
+  }
+});
+
+
 // --- Start the server ---
 const listener = app.listen(process.env.PORT || 3000, () => {
   console.log('Your app is listening on port ' + listener.address().port);
