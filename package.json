@@ -1,0 +1,17 @@
+{
+  "name": "shopify-tracker-backend",
+  "version": "1.0.0",
+  "description": "Backend for Shopify tracking app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "firebase-admin": "^11.11.1",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
