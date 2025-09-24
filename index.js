@@ -5,9 +5,15 @@ const express = require('express');
 const fetch = require('node-fetch');
 // The Firebase Admin SDK is used for secure server-to-server communication with Firebase
 const admin = require('firebase-admin');
+// CORS is a package that allows the browser to securely talk to our server from a different domain
+const cors = require('cors');
 
 // --- Initialize Express App ---
 const app = express();
+
+// Use the CORS middleware to allow cross-origin requests
+app.use(cors());
+
 // This is a middleware that allows our app to understand incoming JSON data from Shopify's webhooks
 app.use(express.json());
 
