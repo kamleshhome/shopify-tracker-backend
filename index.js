@@ -48,6 +48,7 @@ const verifyShopifyWebhook = (req, res, next) => {
         .digest('base64');
 
     if (genHash === hmac) {
+        req.body = JSON.parse(body.toString()); // Make parsed body available
         next();
     } else {
         console.error('Webhook verification failed: HMAC mismatch.');
@@ -66,8 +67,7 @@ app.get('/', (req, res) => {
 // We get the raw body for verification, then use express.json() for the actual logic
 app.post('/webhooks/fulfillments/create', express.raw({ type: 'application/json' }), verifyShopifyWebhook, async (req, res) => {
     try {
-        // Now that it's verified, we can parse the JSON from the raw body
-        const fulfillment = JSON.parse(req.body.toString());
+        const fulfillment = req.body; // Body is already parsed by middleware
         console.log('Received and verified fulfillment webhook:', fulfillment.name);
 
         const orderName = fulfillment.name; 
