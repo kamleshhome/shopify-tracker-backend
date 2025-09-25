@@ -1,51 +1,75 @@
 // --- Import necessary libraries ---
 const express = require('express');
+const crypto = require('crypto');
 const admin = require('firebase-admin');
-const cors = require('cors');
-const crypto = require('crypto'); // Built-in Node.js library for security
+const cors = require('cors'); // Import the CORS library
 
 // --- Initialize Express App ---
 const app = express();
+
+// --- IMPORTANT SECURITY: Use the CORS middleware ---
+// This allows your frontend page to make requests to this server
 app.use(cors());
 
 // --- Firebase Configuration ---
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-const db = admin.firestore();
-console.log('Firebase Admin SDK initialized successfully.');
+// This is securely loaded from the Environment Variables on Render
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
 
-// --- Shopify Credentials (from your Private App) ---
+if (serviceAccount.project_id) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('Firebase Admin SDK initialized successfully.');
+} else {
+    console.error('FIREBASE_SERVICE_ACCOUNT environment variable is not set correctly.');
+}
+
+const db = admin.firestore();
+
+// --- Shopify App Configuration ---
+// This is securely loaded from the Environment Variables on Render
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
 // --- Middleware to verify Shopify Webhooks ---
-// This is a security step to ensure the data is really from Shopify
 const verifyShopifyWebhook = (req, res, next) => {
     const hmac = req.get('X-Shopify-Hmac-Sha256');
-    const body = req.rawBody;
-    const hash = crypto.createHmac('sha256', SHOPIFY_WEBHOOK_SECRET).update(body, 'utf8', 'hex').digest('base64');
-    if (hash === hmac) {
+    const body = req.rawBody; // We'll get the raw body before it's parsed
+    const topic = req.get('X-Shopify-Topic');
+    const shop = req.get('X-Shopify-Shop-Domain');
+
+    if (!hmac || !body || !topic || !shop) {
+        console.error('Webhook verification failed: Missing required headers.');
+        return res.status(401).send('Unauthorized');
+    }
+
+    const genHash = crypto
+        .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
+        .update(body, 'utf8')
+        .digest('base64');
+
+    if (genHash === hmac) {
         next();
     } else {
-        console.error('Webhook verification failed.');
-        res.status(401).send('Unauthorized');
+        console.error('Webhook verification failed: HMAC mismatch.');
+        return res.status(401).send('Unauthorized');
     }
 };
 
 // --- Routes ---
 
-// 1. Root Route
+// 1. Root Route: A simple welcome message to check if the server is running
 app.get('/', (req, res) => {
-  res.send('Casekaro Tracking Backend is running!');
+  res.send('Shopify Tracking App Backend is running!');
 });
 
 // 2. Webhook Handler: Where Shopify sends fulfillment notifications
-// We use a special middleware to get the raw body for verification
-app.post('/webhooks/fulfillments/create', express.json({
-    verify: (req, res, buf) => { req.rawBody = buf; }
-}), verifyShopifyWebhook, async (req, res) => {
+// We get the raw body for verification, then use express.json() for the actual logic
+app.post('/webhooks/fulfillments/create', express.raw({ type: 'application/json' }), verifyShopifyWebhook, async (req, res) => {
     try {
-        const fulfillment = req.body;
-        console.log('Received fulfillment webhook:', fulfillment);
+        // Now that it's verified, we can parse the JSON from the raw body
+        const fulfillment = JSON.parse(req.body.toString());
+        console.log('Received and verified fulfillment webhook:', fulfillment.name);
+
         const orderName = fulfillment.name; 
         const trackingUrl = fulfillment.tracking_url;
 
@@ -57,31 +81,54 @@ app.post('/webhooks/fulfillments/create', express.json({
             });
             console.log(`Successfully added tracking for order: ${orderName}`);
         }
+        
         res.status(200).send();
+
     } catch (error) {
         console.error('Error processing webhook:', error);
         res.status(200).send();
     }
 });
 
-// 3. Fetch Tracking URL Route (for customers)
+
+// 3. NEW Route: Fetch Tracking URL for the customer-facing page
 app.get('/get-tracking-url', async (req, res) => {
-  // ... (This code remains exactly the same as the previous version)
-  const { orderNumber: rawOrderNumber } = req.query;
-  if (!rawOrderNumber) return res.status(400).json({ error: 'Order number is required.' });
-  const searchTerms = rawOrderNumber.startsWith('#') ? [rawOrderNumber, rawOrderNumber.substring(1)] : [rawOrderNumber, '#' + rawOrderNumber];
-  try {
-    const snapshot = await db.collection('orders').where('orderNumber', 'in', searchTerms).limit(1).get();
-    if (snapshot.empty) return res.status(404).json({ error: 'Order not found.' });
-    res.status(200).json({ trackingUrl: snapshot.docs[0].data().trackingUrl });
-  } catch (error) {
-    console.error('Error fetching tracking URL:', error);
-    res.status(500).json({ error: 'An internal server error occurred.' });
-  }
+    const orderNumberQuery = req.query.orderNumber;
+    
+    if (!orderNumberQuery) {
+        return res.status(400).json({ error: 'Order number is required.' });
+    }
+
+    try {
+        // Create two versions of the order number to search for
+        const withHash = orderNumberQuery.startsWith('#') ? orderNumberQuery : `#${orderNumberQuery}`;
+        const withoutHash = orderNumberQuery.startsWith('#') ? orderNumberQuery.substring(1) : orderNumberQuery;
+
+        // Query for either version
+        const ordersRef = db.collection('orders');
+        const snapshot = await ordersRef
+            .where('orderNumber', 'in', [withHash, withoutHash])
+            .limit(1)
+            .get();
+
+        if (snapshot.empty) {
+            console.log(`Order not found for query: ${orderNumberQuery}`);
+            return res.status(404).json({ error: 'Order not found.' });
+        }
+
+        const orderData = snapshot.docs[0].data();
+        console.log(`Found tracking URL for: ${orderNumberQuery}`);
+        return res.status(200).json({ trackingUrl: orderData.trackingUrl });
+
+    } catch (error) {
+        console.error('Error fetching tracking URL from Firestore:', error);
+        return res.status(500).json({ error: 'An internal server error occurred.' });
+    }
 });
 
 // --- Start the server ---
-const listener = app.listen(process.env.PORT || 3000, () => {
-  console.log('Your app is listening on port ' + listener.address().port);
+const port = process.env.PORT || 10000;
+app.listen(port, () => {
+  console.log(`Your app is listening on port ${port}`);
 });
 
