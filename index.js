@@ -2,13 +2,11 @@
 const express = require('express');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
-const cors = require('cors'); // Import the CORS library
+const cors = require('cors');
 
 // --- Initialize Express App ---
 const app = express();
-
-// --- IMPORTANT SECURITY: Use the CORS middleware ---
-app.use(cors());
+app.use(cors()); // Allow CORS for frontend
 
 // --- Firebase Configuration ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -17,24 +15,27 @@ if (serviceAccount.project_id) {
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
     });
-    console.log('Firebase Admin SDK initialized successfully.');
+    console.log('🔥 Firebase Admin SDK initialized successfully.');
 } else {
-    console.error('FIREBASE_SERVICE_ACCOUNT environment variable is not set correctly.');
+    console.error('❌ FIREBASE_SERVICE_ACCOUNT environment variable is not set correctly.');
 }
 
 const db = admin.firestore();
 
-// --- Shopify App Configuration ---
+// --- Shopify Configuration ---
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
-// --- Middleware to verify Shopify Webhooks ---
+// --- Middleware: Parse raw body for Shopify HMAC ---
+app.use('/webhooks/fulfillments/create', express.raw({ type: 'application/json' }));
+
+// --- Middleware to verify Shopify HMAC ---
 const verifyShopifyWebhook = (req, res, next) => {
     const hmac = req.get('X-Shopify-Hmac-Sha256');
     const topic = req.get('X-Shopify-Topic');
     const shop = req.get('X-Shopify-Shop-Domain');
 
     if (!hmac || !req.body || !topic || !shop) {
-        console.error('Webhook verification failed: Missing required headers.');
+        console.error('❌ Webhook verification failed: Missing required headers.');
         return res.status(401).send('Unauthorized');
     }
 
@@ -43,58 +44,51 @@ const verifyShopifyWebhook = (req, res, next) => {
         .update(req.body)
         .digest('base64');
 
-    if (generatedHash === hmac) {
-        try {
-            req.body = JSON.parse(req.body.toString()); // Parse raw body
-            next();
-        } catch (err) {
-            console.error('Webhook verification failed: Invalid JSON body.');
-            return res.status(400).send('Bad Request');
-        }
-    } else {
-        console.error('Webhook verification failed: HMAC mismatch.');
+    if (generatedHash !== hmac) {
+        console.error('❌ Webhook verification failed: HMAC mismatch.');
         return res.status(401).send('Unauthorized');
+    }
+
+    try {
+        req.body = JSON.parse(req.body.toString('utf8')); // Safe parse
+        next();
+    } catch (err) {
+        console.error('❌ Invalid JSON in webhook payload.');
+        return res.status(400).send('Bad Request');
     }
 };
 
-// --- Routes ---
-
-// 1. Root Route
+// --- Root Route ---
 app.get('/', (req, res) => {
-    res.send('Shopify Tracking App Backend is running!');
+    res.send('✅ Shopify Tracking App Backend is running!');
 });
 
-// 2. Fulfillment Webhook Handler
-app.post(
-    '/webhooks/fulfillments/create',
-    express.raw({ type: 'application/json' }), // 🔧 required for HMAC verification
-    verifyShopifyWebhook,
-    async (req, res) => {
-        try {
-            const fulfillment = req.body;
-            console.log('Received and verified fulfillment webhook:', fulfillment.name);
+// --- Webhook: Fulfillment Creation ---
+app.post('/webhooks/fulfillments/create', verifyShopifyWebhook, async (req, res) => {
+    try {
+        const fulfillment = req.body;
+        console.log('📦 Received fulfillment webhook for:', fulfillment.name);
 
-            const orderName = fulfillment.name;
-            const trackingUrl = fulfillment.tracking_url;
+        const orderName = fulfillment.name;
+        const trackingUrl = fulfillment.tracking_url;
 
-            if (orderName && trackingUrl) {
-                await db.collection('orders').add({
-                    orderNumber: orderName,
-                    trackingUrl: trackingUrl,
-                    createdAt: new Date()
-                });
-                console.log(`✅ Successfully added tracking for order: ${orderName}`);
-            }
-
-            res.status(200).send();
-        } catch (error) {
-            console.error('❌ Error processing webhook:', error);
-            res.status(200).send(); // Respond 200 to prevent retries
+        if (orderName && trackingUrl) {
+            await db.collection('orders').add({
+                orderNumber: orderName,
+                trackingUrl: trackingUrl,
+                createdAt: new Date()
+            });
+            console.log(`✅ Stored tracking URL for order: ${orderName}`);
         }
-    }
-);
 
-// 3. Tracking URL Lookup Endpoint
+        res.status(200).send();
+    } catch (err) {
+        console.error('❌ Error handling webhook:', err);
+        res.status(200).send(); // Still return 200 to avoid retry spam
+    }
+});
+
+// --- Public Route: Get Tracking URL by Order ID ---
 app.get('/get-tracking-url', async (req, res) => {
     const orderNumberQuery = req.query.orderNumber;
 
@@ -104,7 +98,7 @@ app.get('/get-tracking-url', async (req, res) => {
 
     try {
         const withHash = orderNumberQuery.startsWith('#') ? orderNumberQuery : `#${orderNumberQuery}`;
-        const withoutHash = orderNumberQuery.startsWith('#') ? orderNumberQuery.substring(1) : orderNumberQuery;
+        const withoutHash = orderNumberQuery.startsWith('#') ? orderNumberQuery.slice(1) : orderNumberQuery;
 
         const snapshot = await db.collection('orders')
             .where('orderNumber', 'in', [withHash, withoutHash])
@@ -112,7 +106,7 @@ app.get('/get-tracking-url', async (req, res) => {
             .get();
 
         if (snapshot.empty) {
-            console.log(`❓ Order not found for query: ${orderNumberQuery}`);
+            console.log(`❓ Order not found for: ${orderNumberQuery}`);
             return res.status(404).json({ error: 'Order not found.' });
         }
 
@@ -120,14 +114,14 @@ app.get('/get-tracking-url', async (req, res) => {
         console.log(`🔗 Found tracking URL for: ${orderNumberQuery}`);
         return res.status(200).json({ trackingUrl: orderData.trackingUrl });
 
-    } catch (error) {
-        console.error('🔥 Error fetching tracking URL from Firestore:', error);
-        return res.status(500).json({ error: 'An internal server error occurred.' });
+    } catch (err) {
+        console.error('🔥 Error fetching from Firestore:', err);
+        return res.status(500).json({ error: 'Internal server error.' });
     }
 });
 
 // --- Start Server ---
 const port = process.env.PORT || 10000;
 app.listen(port, () => {
-    console.log(`🚀 App is listening on port ${port}`);
+    console.log(`🚀 App running on port ${port}`);
 });
