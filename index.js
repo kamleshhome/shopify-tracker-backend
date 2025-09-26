@@ -5,114 +5,131 @@ const cors = require('cors');
 
 const app = express();
 
-// ✅ Capture raw body for HMAC before body is parsed
-app.use(
-  express.raw({
-    type: 'application/json',
-    verify: (req, res, buf) => {
-      req.rawBody = buf;
-    }
-  })
-);
+// Capture raw body for HMAC
+app.use(express.raw({
+  type: 'application/json',
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 
-// ✅ Enable CORS
 app.use(cors());
 
-// ✅ Firebase
+// Firebase
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
 if (serviceAccount.project_id) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
   console.log('✅ Firebase Admin SDK initialized.');
+} else {
+  console.error('❌ FIREBASE_SERVICE_ACCOUNT not set.');
 }
 const db = admin.firestore();
 
-// ✅ Shopify Webhook Secret
+// Secrets
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
-// ✅ Middleware to verify HMAC
+// Helpers
+const normalizeOrderNumber = (raw = '') =>
+  raw.toString()
+     .replace(/^#?/, '')     // remove leading '#'
+     .replace(/\.\d+$/, ''); // remove '.1', '.2', etc.
+
+const pickTrackingUrl = (f = {}) =>
+  (Array.isArray(f.tracking_urls) && f.tracking_urls[0]) ||
+  f.tracking_url ||
+  null;
+
+// HMAC verification
 const verifyShopifyWebhook = (req, res, next) => {
   const hmac = req.get('X-Shopify-Hmac-Sha256');
   const topic = req.get('X-Shopify-Topic');
-  const shop = req.get('X-Shopify-Shop-Domain');
+  const shop  = req.get('X-Shopify-Shop-Domain');
 
   if (!hmac || !req.rawBody || !topic || !shop) {
     console.error('❌ Missing required headers.');
     return res.status(401).send('Unauthorized');
   }
 
-  const generatedHash = crypto
-    .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
-    .update(req.rawBody)
-    .digest('base64');
+  const gen = crypto.createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
+                    .update(req.rawBody)
+                    .digest('base64');
 
-  if (generatedHash === hmac) {
-    try {
-      req.body = JSON.parse(req.rawBody.toString('utf8'));
-      next();
-    } catch (err) {
-      console.error('❌ Invalid JSON body');
-      return res.status(400).send('Bad Request');
-    }
-  } else {
+  if (gen !== hmac) {
     console.error('❌ HMAC mismatch.');
     return res.status(401).send('Unauthorized');
   }
+
+  try {
+    req.body = JSON.parse(req.rawBody.toString('utf8'));
+    next();
+  } catch {
+    console.error('❌ Invalid JSON body.');
+    return res.status(400).send('Bad Request');
+  }
 };
 
-// --- Routes --- //
+// Root
+app.get('/', (_req, res) => res.send('✅ Shopify Tracking Backend is live'));
 
-app.get('/', (req, res) => {
-  res.send('✅ Shopify Tracking Backend is live');
-});
-
-app.post('/webhooks/fulfillments/create', verifyShopifyWebhook, async (req, res) => {
+// Shared handler
+const handleFulfillment = async (req, res, source) => {
   try {
-    const fulfillment = req.body;
-    console.log('📦 Fulfillment received:', fulfillment.name);
+    const f = req.body;
+    const rawName = f?.name || '';
+    const base = normalizeOrderNumber(rawName);
+    const display = `#${base}`;
+    const trackingUrl = pickTrackingUrl(f);
 
-    const orderName = fulfillment.name;
-    const trackingUrl = fulfillment.tracking_url;
+    console.log(`📦 ${source} received:`, rawName);
 
-    if (orderName && trackingUrl) {
-      await db.collection('orders').add({
-        orderNumber: orderName,
-        trackingUrl: trackingUrl,
-        createdAt: new Date()
-      });
-      console.log(`✅ Stored tracking for ${orderName}`);
+    if (base && trackingUrl) {
+      // Upsert by doc id = base order number
+      const docRef = db.collection('orders').doc(base);
+      await docRef.set({
+        orderNumberBase: base,
+        orderNumber: display,
+        trackingUrl,
+        updatedAt: new Date()
+      }, { merge: true });
+
+      // Optional: append to history subcollection
+      await docRef.collection('history').add({ trackingUrl, at: new Date(), source });
+
+      console.log(`✅ Stored tracking for ${rawName} → ${trackingUrl}`);
+    } else {
+      console.log(`ℹ️ Missing data. base:${base} tracking:${trackingUrl}`);
     }
 
     res.status(200).send();
   } catch (err) {
-    console.error('🔥 Error handling fulfillment webhook:', err);
-    res.status(200).send(); // Respond 200 so Shopify doesn’t retry
+    console.error('🔥 Error handling fulfillment:', err);
+    // still 200 to avoid retries storm
+    res.status(200).send();
   }
-});
+};
 
+// Webhooks
+app.post('/webhooks/fulfillments/create', verifyShopifyWebhook, (req, res) =>
+  handleFulfillment(req, res, 'FULFILLMENTS_CREATE')
+);
+
+app.post('/webhooks/fulfillments/update', verifyShopifyWebhook, (req, res) =>
+  handleFulfillment(req, res, 'FULFILLMENTS_UPDATE')
+);
+
+// Public lookup
 app.get('/get-tracking-url', async (req, res) => {
-  const orderNumberQuery = req.query.orderNumber;
-
-  if (!orderNumberQuery) {
-    return res.status(400).json({ error: 'Order number is required.' });
-  }
+  const q = (req.query.orderNumber || '').toString().trim();
+  if (!q) return res.status(400).json({ error: 'Order number is required.' });
 
   try {
-    const withHash = orderNumberQuery.startsWith('#') ? orderNumberQuery : `#${orderNumberQuery}`;
-    const withoutHash = orderNumberQuery.startsWith('#') ? orderNumberQuery.substring(1) : orderNumberQuery;
+    const base = normalizeOrderNumber(q); // works with or without '#', ignores '.1'
+    const snap = await db.collection('orders').doc(base).get();
 
-    const snapshot = await db.collection('orders')
-      .where('orderNumber', 'in', [withHash, withoutHash])
-      .limit(1)
-      .get();
-
-    if (snapshot.empty) {
-      console.log(`❓ Order not found: ${orderNumberQuery}`);
+    if (!snap.exists) {
+      console.log(`❓ Order not found: ${q}`);
       return res.status(404).json({ error: 'Order not found.' });
     }
 
-    const data = snapshot.docs[0].data();
+    const data = snap.data();
     return res.status(200).json({ trackingUrl: data.trackingUrl });
   } catch (error) {
     console.error('🔥 Error fetching tracking:', error);
@@ -120,7 +137,6 @@ app.get('/get-tracking-url', async (req, res) => {
   }
 });
 
+// Start
 const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
+app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
